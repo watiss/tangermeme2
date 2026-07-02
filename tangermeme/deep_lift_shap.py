@@ -95,6 +95,7 @@ def hypothetical_attributions(
 def _register_hooks(module): 
 	if len(module._backward_hooks) > 0:
 		return
+	# for the other modules the normal torch gradient will appl
 	if not isinstance(module, tuple(module._NON_LINEAR_OPS.keys())):
 		return
 
@@ -113,102 +114,21 @@ def _clear_hooks(module):
 
 
 def _fp_hook(module, inputs): 
+	# save a copy of the input to the module. this is needed for example in _nonlinear
+    # so that we can do delta_y / delta_x. The delta_y comes from doing a diff of module
+    # output for a seq and module output for its reference seq. Same for delta_x. inputs
+    # is a tuple (of size 1) so just grab the input
 	module.input = inputs[0].clone().detach()
 
 
 def _f_hook(module, inputs, outputs):
+	# save a copy of the output of the module. outputs is a tensor
 	module.output = outputs.clone().detach()
 
 
 def _b_hook(module, grad_input, grad_output):
 	return module._NON_LINEAR_OPS[type(module)](module, grad_input, 
 		grad_output)
-
-
-def _nonlinear(module, grad_input, grad_output):
-	"""An internal function implementing a general-purpose nonlinear correction.
-
-	This function, copied and slightly modified from Captum, is meant to be
-	the `rescale` rule applied to general non-linear functions such as
-	activations.
-	"""
-
-	delta_in_ = torch.sub(*module.input.chunk(2))
-	delta_out_ = torch.sub(*module.output.chunk(2))
-
-	delta_in = torch.cat([delta_in_, delta_in_])
-	delta_out = torch.cat([delta_out_, delta_out_])
-
-	delta = delta_out / delta_in
-	idxs = torch.abs(delta_in) < 1e-6
-
-	return (torch.where(idxs, grad_input[0], grad_output[0] * delta),)
-
-
-def _softmax(module, grad_input, grad_output):
-	"""An internal function implementing a correction for softmax activations.
-
-	This function, copied and slightly modified from Captum, is meant to be
-	the `rescale` rule applied specifically to softmax activations without
-	needing to remove them and operate on the underlying logits.
-	"""
-
-	delta_in_ = torch.sub(*module.input.chunk(2))
-	delta_out_ = torch.sub(*module.output.chunk(2))
-
-	delta_in = torch.cat([delta_in_, delta_in_])
-	delta_out = torch.cat([delta_out_, delta_out_])
-
-	delta = delta_out / delta_in
-	idxs = torch.abs(delta_in) < 1e-6
-
-	grad_input_unnorm = torch.where(idxs, grad_input[0], grad_output[0] * delta)
-
-	n = grad_input[0].numel()
-	new_grad_inp = grad_input_unnorm - grad_input_unnorm.sum() * 1 / n
-	return (new_grad_inp,)
-
-
-def _maxpool(module, grad_input, grad_output):
-	"""An internal function implementing a 1D max-pooling correction.
-
-	This function, copied and slightly modified from Captum, is meant to be
-	the `rescale` rule applied to max pooling layers given their nature of
-	aggregating values across multiple positions.
-	"""
-
-	if isinstance(module, torch.nn.MaxPool1d):
-		pool_func, unpool_func = F.max_pool1d, F.max_unpool1d
-	elif isinstance(module, torch.nn.MaxPool2d):
-		pool_func, unpool_func = F.max_pool2d, F.max_unpool2d
-	else:
-		raise ValueError("module must be either MaxPool1d or MaxPool2d")
-
-
-	with torch.no_grad():
-		delta_in_ = torch.sub(*module.input.chunk(2))
-		delta_in = torch.cat([delta_in_, delta_in_])
-
-		output, output_ref = module.output.chunk(2)
-		delta_out_xmax = torch.max(output, output_ref)
-		delta_out = torch.cat([delta_out_xmax - output_ref, 
-			output - delta_out_xmax])
-
-		_, indices = pool_func(module.input, module.kernel_size, module.stride, 
-			module.padding, module.dilation, module.ceil_mode, True)
-
-		unpool_ = unpool_func(grad_output[0] * delta_out, indices, 
-			module.kernel_size, module.stride, module.padding, 
-			list(module.input.shape))
-		unpool_delta, unpool_ref_delta = torch.chunk(unpool_, 2)
-
-	unpool_delta_ = unpool_delta + unpool_ref_delta
-	unpool_delta = torch.cat([unpool_delta_, unpool_delta_])
-	idxs = torch.abs(delta_in) < 1e-7
-
-	new_grad_inp = torch.where(idxs, grad_input[0], unpool_delta / delta_in)
-	return (new_grad_inp,)
-
 
 def deep_lift_shap(
 	model: torch.nn.Module,
@@ -223,6 +143,7 @@ def deep_lift_shap(
 	warning_threshold: float = 0.001,
 	additional_nonlinear_ops: dict | None = None,
 	print_convergence_deltas: bool = False,
+	print_convergence_delta_stats: bool = False,
 	raw_outputs: bool = False,
 	only_warn: bool = False,
 	dtype: str | torch.dtype | None = None,
@@ -340,6 +261,10 @@ def deep_lift_shap(
 		Whether to print the convergence deltas for each example when using
 		DeepLiftShap. Default is False.
 
+	print_convergence_delta_stats: bool, optional
+		Whether to print convergence delta statistics (eg mean, max, min) across
+		all example-reference pairs. Default is False.
+
 	raw_outputs: bool, optional
 		Whether to return the raw outputs from the method -- in this case,
 		the multipliers for each example-reference pair -- or the processed
@@ -411,10 +336,14 @@ def deep_lift_shap(
 		torch.nn.PReLU: _nonlinear,
 		torch.nn.MaxPool1d: _maxpool,
 		torch.nn.MaxPool2d: _maxpool,
-		torch.nn.Softmax: _softmax
+		torch.nn.Softmax: softmax_log_ratio_product_rule,
+		torch.nn.LayerNorm: layernorm_symmetric_rule,
 	}
 
 	device = _resolve_device(device)
+
+	if random_state is not None:
+		print(f"DLS: setting random state to {random_state}")
 
 	if dtype is None:
 		try:
@@ -453,6 +382,8 @@ def deep_lift_shap(
 		# Begin DeepLIFT procedure
 	
 		attributions, references_, Xi, rj, attr_ = [], [], [], [], []
+		all_convergence_deltas = [] # per example-reference pair, always collected
+
 		if isinstance(references, torch.Tensor):
 			_validate_input(references, "references", shape=(X.shape[0], -1, X.shape[1], 
 				X.shape[2]), ohe=True, allow_N=False, ohe_dim=-2, only_warn=only_warn)
@@ -461,13 +392,19 @@ def deep_lift_shap(
 		n, z = X.shape[0] * n_shuffles, 0
 
 		for i in trange(n, disable=not verbose):
+			# Xi will be like [0,0,0, 1,1,1, 2,2,2, ...] if n_shuffles=3, so when len(Xi) == batch_size,
+			# there are 3 0's, 3 1's, etc. in Xi, so X[Xi] will contain 3 times the first seq in X, 3 times
+			# the second seq, etc. Note that batch_size does not have to be a multiple of n_shuffles so for
+			# instance Xi might be like [0,0,0, 1,1,1, 2,2,2, 3,3,3, 4,4] (in this case batch_size=14)
 			Xi.append(i // n_shuffles)
 			rj.append(i % n_shuffles)
 
 			if len(Xi) == batch_size or i == (n-1):
 				_X = X[Xi].cpu().type(dtype)
-				_args = None if args is None else tuple([a[Xi].to(device).type(dtype)
-					for a in args])
+				_args = None
+				if args is not None:
+					_args_lst = [None if a is None else a[Xi].to(device) for a in args]
+					_args = tuple(_args_lst)
 
 				# Handle reference sequences while ensuring that the same seed is
 				# used for each shuffle even if not all shuffles are done in the
@@ -475,6 +412,9 @@ def deep_lift_shap(
 				if isinstance(references, torch.Tensor):
 					_references = references[Xi, rj]
 				else:
+					# shuffle each seq once (_X already contains n_shuffle entries) -- the [:, 0]
+					# is b/c references(_X, n=1).shape = torch.Size([n_examples, 1, 4, seq_length]),
+					# and 1 is b/c n=1
 					if random_state is None:
 						_references = references(_X, n=1)[:, 0]
 					else:
@@ -483,7 +423,9 @@ def deep_lift_shap(
 								for j in range(len(_X))])
 
 				_X = _X.to(device).type(dtype).requires_grad_()
+				# now _X.shape = torch.Size([n_examples, 4, seq_length])
 				_references = _references.to(device).type(dtype).requires_grad_()
+				# now _references.shape = torch.Size([n_examples, 4, seq_length])
 
 				# This next block is actually running DeepLIFT by concatenating the
 				# batch of examples and the batch of references and running the
@@ -492,6 +434,7 @@ def deep_lift_shap(
 				# error is raised. 
 				try:
 					X_ = torch.cat([_X, _references])
+					# now X_.shape = torch.Size([n_examples*2, 4, seq_length])
 
 					if use_autocast:
 						autocast_ctx = torch.autocast(device_type=device.type, dtype=dtype)
@@ -502,11 +445,22 @@ def deep_lift_shap(
 					with torch.autograd.set_grad_enabled(True):
 						with autocast_ctx:
 							if _args is not None:
-								_args = (torch.cat([arg, arg]) for arg in _args)
+								_args = (None if arg is None else torch.cat([arg, arg]) for arg in _args)
 								y = model(X_, *_args)[:, target]
 							else:
+								# The model here is actually a wrapper model (like CountWrapper)
+								# that returns only the output type we're interested in.
+								# model(X_).shape = torch.Size([n_examples*2, 1]).
+								# In the case of counts w/ a target=0, the "[:, target]" is basically
+								# a no-op.
 								y = model(X_)[:, target]
 
+							# when we do the forward pass, _X is a specific tensor object in
+							# memory with requires_grad=True, when we later call torch.autograd.grad(y.sum(), _X)
+							# we are passing the exact same tensor object that was used (via concatenation) to
+							# build X_. Here torch.autograd.grad returns gradients only for _X (and not for the
+							# _references).
+							# multipliers.shape = _X.shape = torch.Size([n_examples, 4, seq_length])
 							multipliers = torch.autograd.grad(y.sum(), _X)[0]
 
 					# Check that the prediction-difference-from-reference is equal to
@@ -519,7 +473,8 @@ def deep_lift_shap(
 					if torch.any(convergence_deltas > warning_threshold):
 						warnings.warn("Convergence deltas too high: " +   
 							str(convergence_deltas), RuntimeWarning)
-
+						
+					all_convergence_deltas.append(convergence_deltas.detach().cpu())
 					if print_convergence_deltas:
 						print(convergence_deltas)
 
@@ -537,13 +492,19 @@ def deep_lift_shap(
 				# of one example-reference pair, so that once all references for an
 				# example have been processed we can chunk them together.
 				attr_.extend(list(multipliers.cpu().detach()))
+				# now len(attr_) = multipliers.shape[0] = batch_size
 
 				# When all references for a sequence have been calculated, remove
 				# that block from the list of example-reference attributions and
 				# add it to the final attribution list, averaging across references
 				# if providing the processed results.
 				while len(attr_) >= n_shuffles:
+					# Take the first n_shuffles elements from attr_
+					# this includes the attributions for all references for one seq
+					# attr_chunk.shape = torch.Size([n_shuffles, 4, seq_length])
 					attr_chunk = torch.stack(attr_[:n_shuffles])
+					# now attr_chunk.shape = torch.Size([4, seq_length]), ie avg attr
+					# (across shuffles) for one seq
 
 					if raw_outputs == False:
 						attr_chunk = attr_chunk.mean(dim=0)
@@ -559,8 +520,12 @@ def deep_lift_shap(
 
 				Xi, rj = [], []
 
-
-
+		all_deltas = torch.cat(all_convergence_deltas)  # shape: (n_examples * n_shuffles,)
+		if print_convergence_delta_stats:
+			print(f"Convergence delta stats — mean: {all_deltas.mean().item():.6e}, "
+				f"max: {all_deltas.max().item():.6e}, "
+				f"min: {all_deltas.min().item():.6e}")
+		
 		attributions = torch.stack(attributions)
 
 		if return_references:
