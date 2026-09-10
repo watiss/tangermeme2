@@ -39,7 +39,7 @@ X_attr = deep_lift_shap(model, X, target=267, random_state=0)
 
 If the model returns *multiple tensors* (a list), `target` cannot select among
 them — wrap the model so its forward returns a single tensor first (see
-[model-wrapping.md](model-wrapping.md)).
+`references/model-wrapping.md`).
 
 ## Footgun #2 — reproducibility needs `random_state=`
 
@@ -49,7 +49,7 @@ make them deterministic (required when capturing regression values). For compari
 attributions **across tasks or models**, holding `random_state` *and* `n_shuffles`
 fixed is mandatory — otherwise each call attributes against different backgrounds
 and the differences you see are noise, not signal (see
-[comparing-models.md](comparing-models.md)). A custom `references=` callable has the
+`references/comparing-models.md`). A custom `references=` callable has the
 signature `f(X, n, random_state) -> (n_examples, n, len(alphabet), length)`; if you
 only shuffle a sub-span, attributions are exactly `0` outside it — don't interpret
 those positions.
@@ -123,7 +123,7 @@ genuinely precision-driven deltas, `deep_lift_shap(model.double(), X.double(),
 references=refs.double(), ...)` drops them to ~1e-16 (slower; fp64).
 
 When you can't get deltas down (an op that can't be expressed as a shape-preserving
-hook), switch to ISM — see [saturation_mutagenesis.md](saturation_mutagenesis.md).
+hook), switch to ISM — see `references/saturation_mutagenesis.md`.
 
 ## hypothetical vs projected attributions
 
@@ -134,7 +134,7 @@ hook), switch to ISM — see [saturation_mutagenesis.md](saturation_mutagenesis.
   downstream — **not** as the seqlet-caller input.
 
 The seqlet callers take the projected output collapsed over the channel axis
-(`X_attr.sum(dim=1)`) — see [seqlets.md](seqlets.md).
+(`X_attr.sum(dim=1)`) — see `references/seqlets.md`.
 
 ## Return type
 
@@ -154,11 +154,11 @@ plot_logo(X_attr[0], ax=ax)   # tangermeme has its own logo plotting (no logomak
 `deep_lift_shap` satisfies the `func=` contract, so it drops into `marginalize`,
 `ablate`, `variant_effect.*`, etc. to get attributions before/after an edit —
 route attribution kwargs via `additional_func_kwargs` (see
-[func-pattern.md](func-pattern.md)).
+`references/func-pattern.md`).
 
 ## Related references
 
-[saturation_mutagenesis.md](saturation_mutagenesis.md) (the forward-pass
-alternative), [seqlets.md](seqlets.md) (consuming projected attributions),
-[model-wrapping.md](model-wrapping.md) (single-tensor requirement),
-[comparing-models.md](comparing-models.md) (shared references across models).
+`references/saturation_mutagenesis.md` (the forward-pass
+alternative), `references/seqlets.md` (consuming projected attributions),
+`references/model-wrapping.md` (single-tensor requirement),
+`references/comparing-models.md` (shared references across models).
