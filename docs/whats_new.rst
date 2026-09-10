@@ -13,6 +13,7 @@ Claude Code skill
 -----------------
 
 	- Corrects the bundled Agent Skill against the library. Claims that did not match the implementation are fixed: ``predict`` returns the model's parameter dtype rather than always float32; the int8 sequences from ``extract_loci`` should be left as int8 because every entry point except ``pisa`` upcasts each batch; ``recursive_seqlets``' ``additional_flanks`` re-sums the reported attribution rather than only padding the coordinates; ``product.apply_pairwise``/``apply_product`` take ``func`` as a required first positional argument and so do not satisfy the ``func=`` contract themselves; ``apply_pairwise`` zips the elements of ``args`` with each other and crosses that list with every example; ``ablate_annotations``' second output axis is always one; ``plot_logo`` reads the annotation label from the first column positionally and filters the plotted window strictly; the DeepLIFT/SHAP hooks cover twenty stock non-linearities rather than five; ``pairwise_annotations`` sorts away input row order under the default ``unique=True``; and the deletion-width guard and the ``max_iter``/``tol`` stop conditions differ per function. Also documents ``saturation_mutagenesis``' own ``func=`` post-processing hook and its int8 truncation warning, and fixes three examples that could not run.
+	- Replaces every cross-reference between skill files with a backticked path, ``references/design.md``, in place of a Markdown link. Nothing that reads a skill renders Markdown, so ``[references/design.md](references/design.md)`` spent twice the characters to show the agent the same path twice; the eighty-eight links in the skill are now single backticked paths. The bare mentions that named a file without its directory, such as ``model-wrapping.md``, are now complete paths, which previously left the reader to work out that the file sits under ``references/``.
 	- If you installed the skill with ``tangermeme-install-skills``, re-run it with ``--force`` to pick up the corrections.
 
 annotate
@@ -29,6 +30,12 @@ variant_effect
 --------------
 
 	- ``substitution_effect`` now raises a ``ValueError`` when two rows of ``substitutions`` target the same ``(example_idx, position)``. The substitutions are applied with two vectorized assignments over an example-shaped tensor, so colliding rows each set their own alphabet index to one and the model was handed a multi-hot column with no error. The same position in different examples is still valid.
+
+Testing
+-------
+
+	- Moves the tests for the ``tangermeme.design`` subpackage into ``tests/design/`` and the installer test into ``tests/_skills/test_install.py``, so the test tree mirrors the package tree. ``tangermeme.design`` became a subpackage in 1.4.0 but its tests stayed flat in ``tests/``, leaving no way to tell from the test tree which module a file covered.
+	- Rewrites the bundled-skill integrity checks against backticked reference paths rather than Markdown-link syntax. The old check scanned for ``](...)`` and so would have reported success on a skill with no links left in it at all. It now also fails when a Markdown link is reintroduced, and when a ``references/*.md`` file is not reachable from the ``SKILL.md`` router table.
 
 
 Version 1.4.0
