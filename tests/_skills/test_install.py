@@ -60,8 +60,10 @@ def test_skill_frontmatter():
 	fields = dict(re.findall(r'^(\w+):\s*(.*)$', frontmatter, flags=re.MULTILINE))
 
 	assert fields.get("name") == "tangermeme"
-	# Claude Code caps the description (combined with when_to_use) at 1536 chars.
-	assert 0 < len(fields.get("description", "")) <= 1536
+	# 1024 is the spec maximum for a description, and the limit enforced by
+	# skill-creator's quick_validate.py. This asserted 1536 until 2026-09-10,
+	# so a description between the two passed here and failed validation.
+	assert 0 < len(fields.get("description", "")) <= 1024
 
 
 def test_internal_references_all_resolve():
