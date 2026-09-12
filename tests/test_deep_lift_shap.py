@@ -19,9 +19,10 @@ from tangermeme.ersatz import dinucleotide_shuffle
 from tangermeme.deep_lift_shap import hypothetical_attributions
 from tangermeme.deep_lift_shap import deep_lift_shap
 from tangermeme.deep_lift_shap import _captum_deep_lift_shap
-from tangermeme.deep_lift_shap import _nonlinear
+from tangermeme.deep_lift_utils import _nonlinear
+from tangermeme.deep_lift_utils import make_local_ig_autograd
 
-from .toy_models import SumModel
+from .toy_models import SoftmaxModel, SumModel
 from .toy_models import FlattenDense
 from .toy_models import Conv
 from .toy_models import Scatter
@@ -37,6 +38,8 @@ from .toy_models import DilatedConv
 from .toy_models import MultiActivation
 from .toy_models import DropoutConv
 from .toy_models import MultiInputMultiOutput
+from .toy_models import ConvLayerNorm
+from .toy_models import ConvRMSNorm
 from .toy_models import AttributeNameConv
 
 from numpy.testing import assert_raises
@@ -1421,11 +1424,10 @@ def test_captum_deep_lift_shap_args(X, references, device):
 # Tests for additional architectures.
 #
 # Models whose layers have no rule in `deep_lift_shap._NON_LINEAR_OPS` are
-# intentionally absent here: Transformer (MultiheadAttention/softmax + LayerNorm),
-# ConvBatchNorm (BatchNorm1d), and ConvLayerNorm (LayerNorm). DLS would silently
-# treat those layers as linear and the rescale rule's convergence guarantee
-# would not hold, so a regression test against hardcoded values would be
-# meaningless. Add a model here once its layers gain a registered rule.
+# intentionally absent here. DLS would silently treat those layers as linear
+# and the rescale rule's convergence guarantee would not hold, so a regression
+# test against hardcoded values would be meaningless. Add a model here once its
+# layers gain a registered rule.
 
 
 def test_deep_lift_shap_residual_conv(X, references, device):
@@ -1466,6 +1468,200 @@ def test_deep_lift_shap_conv2d_expand(X, references, device):
 		 [ 0.0016, -0.0000,  0.0000,  0.0000],
 		 [-0.0000, -0.0079,  0.0000, -0.0000],
 		 [ 0.0000,  0.0000, -0.0000,  0.0036]]], 4)
+
+
+def test_deep_lift_shap_layernorm(X, references, device):
+	# fp32 attribution residuals on CUDA are a few orders of magnitude larger
+	# than on CPU, so the convergence threshold is loosened for the cuda pass.
+	threshold = 1e-4 if device == "cpu" else 1e-2
+	torch.manual_seed(0)
+	model = ConvLayerNorm(seq_len=X.shape[-1])
+
+	with warnings.catch_warnings():
+		warnings.simplefilter("error", category=RuntimeWarning)
+
+		X_attr = deep_lift_shap(model, X, references=references, \
+			device=device, random_state=0,
+			warning_threshold=threshold,)
+
+	assert X_attr.shape == X.shape
+	assert X_attr.dtype == torch.float32
+	assert_array_almost_equal(X_attr[:2, :, :4], [
+		[[ 0.0114,  0.0000, -0.0000,  0.0050],
+         [ 0.0000, -0.0000,  0.0695, -0.0000],
+         [-0.0000,  0.0000, -0.0000, -0.0000],
+         [ 0.0000, -0.0054, -0.0000,  0.0000]],
+
+        [[ 0.0000,  0.0000, -0.0063,  0.0000],
+         [ 0.0092,  0.0000,  0.0000, -0.0000],
+         [-0.0000,  0.0183, -0.0000, -0.0000],
+         [ 0.0000, -0.0000,  0.0000,  0.0023]]], 4)
+
+
+def test_deep_lift_shap_layernorm_local_ig(X, references, device):
+	# fp32 attribution residuals on CUDA are a few orders of magnitude larger
+	# than on CPU, so the convergence threshold is loosened for the cuda pass.
+	threshold = 1e-4 if device == "cpu" else 1e-2
+	torch.manual_seed(0)
+	model = ConvLayerNorm(seq_len=X.shape[-1])
+	ig_hook = make_local_ig_autograd(K=8, name="layernorm")
+
+	with warnings.catch_warnings():
+		warnings.simplefilter("error", category=RuntimeWarning)
+
+		X_attr = deep_lift_shap(model, X, references=references, \
+			device=device, random_state=0,
+			warning_threshold=threshold,
+			additional_nonlinear_ops={torch.nn.LayerNorm: ig_hook})
+
+	assert X_attr.shape == X.shape
+	assert X_attr.dtype == torch.float32
+	assert_array_almost_equal(X_attr[:2, :, :4], [
+		[[ 0.0124,  0.0000, -0.0000,  0.0053],
+         [ 0.0000, -0.0000,  0.0768, -0.0000],
+         [-0.0000,  0.0000, -0.0000, -0.0000],
+         [ 0.0000, -0.0064, -0.0000,  0.0000]],
+
+        [[ 0.0000,  0.0000, -0.0076,  0.0000],
+         [ 0.0100,  0.0000,  0.0000, -0.0000],
+         [-0.0000,  0.0195, -0.0000, -0.0000],
+         [ 0.0000, -0.0000,  0.0000,  0.0022]]], 4)
+
+
+def test_deep_lift_shap_rmsnorm(X, references, device):
+	# fp32 attribution residuals on CUDA are a few orders of magnitude larger
+	# than on CPU, so the convergence threshold is loosened for the cuda pass.
+	threshold = 1e-4 if device == "cpu" else 1e-2
+	torch.manual_seed(0)
+	model = ConvRMSNorm(seq_len=X.shape[-1])
+
+	with warnings.catch_warnings():
+		warnings.simplefilter("error", category=RuntimeWarning)
+
+		X_attr = deep_lift_shap(model, X, references=references, \
+			device=device, random_state=0,
+			warning_threshold=threshold,)
+
+	assert X_attr.shape == X.shape
+	assert X_attr.dtype == torch.float32
+	assert_array_almost_equal(X_attr[:2, :, :4], [
+		[[ 0.0108,  0.0000, -0.0000,  0.0037],
+         [ 0.0000, -0.0000,  0.0670, -0.0000],
+         [-0.0000,  0.0000, -0.0000, -0.0000],
+         [ 0.0000, -0.0042, -0.0000,  0.0000]],
+
+        [[ 0.0000,  0.0000, -0.0062,  0.0000],
+         [ 0.0092,  0.0000,  0.0000, -0.0000],
+         [-0.0000,  0.0178, -0.0000, -0.0000],
+         [ 0.0000, -0.0000,  0.0000,  0.0022]]], 4)
+
+
+def test_deep_lift_shap_rmsnorm_local_ig(X, references, device):
+	# The analytic RMSNorm rule and the generic local-IG hook approximate the same
+	# quantity, so their attributions should agree to within quadrature error.
+	threshold = 1e-4 if device == "cpu" else 1e-2
+	torch.manual_seed(0)
+	model = ConvRMSNorm(seq_len=X.shape[-1])
+	ig_hook = make_local_ig_autograd(K=8, name="rmsnorm")
+
+	with warnings.catch_warnings():
+		warnings.simplefilter("error", category=RuntimeWarning)
+
+		X_attr = deep_lift_shap(model, X, references=references, \
+			device=device, random_state=0,
+			warning_threshold=threshold,
+			additional_nonlinear_ops={torch.nn.RMSNorm: ig_hook})
+
+	assert X_attr.shape == X.shape
+	assert X_attr.dtype == torch.float32
+	assert_array_almost_equal(X_attr[:2, :, :4], [
+		[[ 0.0118,  0.0000, -0.0000,  0.0039],
+         [ 0.0000, -0.0000,  0.0741, -0.0000],
+         [-0.0000,  0.0000, -0.0000, -0.0000],
+         [ 0.0000, -0.0051, -0.0000,  0.0000]],
+
+        [[ 0.0000,  0.0000, -0.0074,  0.0000],
+         [ 0.0099,  0.0000,  0.0000, -0.0000],
+         [-0.0000,  0.0190, -0.0000, -0.0000],
+         [ 0.0000, -0.0000,  0.0000,  0.0021]]], 4)
+
+
+def test_deep_lift_shap_norm_completeness(X, references, device):
+	"""The DeepLIFT rules must satisfy summation-to-delta for both norm types.
+
+	This checks the property the hooks exist to preserve, independent of the
+	hard-coded attribution values above, and covers a non-identity gamma/beta
+	(which the default-initialized toy models leave as ones/zeros).
+	"""
+	for cls, seed in ((ConvLayerNorm, 0), (ConvRMSNorm, 1)):
+		torch.manual_seed(seed)
+		model = cls(seq_len=X.shape[-1])
+
+		# Default init leaves the affine params as identity, so randomize them to
+		# exercise the gamma-scaling path in the hooks.
+		norm = model.ln if hasattr(model, "ln") else model.norm
+		torch.nn.init.normal_(norm.weight)
+		if getattr(norm, "bias", None) is not None:
+			torch.nn.init.normal_(norm.bias)
+
+		with warnings.catch_warnings():
+			warnings.simplefilter("error", category=RuntimeWarning)
+
+			X_attr = deep_lift_shap(model, X, references=references,
+				device=device, random_state=0,
+				warning_threshold=1e-4 if device == "cpu" else 1e-2)
+
+		assert X_attr.shape == X.shape
+
+
+def test_deep_lift_shap_rmsnorm_explicit_eps(X, references, device):
+	"""An explicitly-set eps must be honored rather than replaced by finfo.eps.
+
+	`torch.nn.RMSNorm.eps` defaults to None (meaning the dtype epsilon), so the
+	hook must key off None instead of assuming every RMSNorm uses the default;
+	otherwise the rule mismatches the forward pass and convergence deltas blow up.
+	"""
+	torch.manual_seed(0)
+	model = ConvRMSNorm(seq_len=X.shape[-1])
+	model.norm = torch.nn.RMSNorm([8, X.shape[-1]], eps=1e-2)
+
+	with warnings.catch_warnings():
+		warnings.simplefilter("error", category=RuntimeWarning)
+
+		X_attr = deep_lift_shap(model, X, references=references,
+			device=device, random_state=0,
+			warning_threshold=1e-4 if device == "cpu" else 1e-2)
+
+	assert X_attr.shape == X.shape
+
+
+def test_deep_lift_shap_softmax(X, references, device):
+	# fp32 attribution residuals on CUDA are a few orders of magnitude larger
+	# than on CPU, so the convergence threshold is loosened for the cuda pass.
+	threshold = 1e-4 if device == "cpu" else 1e-2
+	torch.manual_seed(0)
+
+	model = LambdaWrapper(SoftmaxModel(), lambda model, X: model(X)[:, 0, 0:1])
+
+	with warnings.catch_warnings():
+		warnings.simplefilter("error", category=RuntimeWarning)
+
+		X_attr = deep_lift_shap(model, X, references=references,
+			device=device, random_state=0,
+			warning_threshold=threshold)
+
+	assert X_attr.shape == X.shape
+	assert X_attr.dtype == torch.float32
+	assert_array_almost_equal(X_attr[:2, :, :4], [
+		[[ 9.3886e-03, -0.0000e+00, -0.0000e+00, -1.0105e-04],
+         [-0.0000e+00,  0.0000e+00,  7.2842e-05,  0.0000e+00],
+         [-0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00],
+         [-0.0000e+00,  2.8212e-05,  0.0000e+00,  0.0000e+00]],
+
+        [[ 0.0000e+00, -0.0000e+00, -4.8106e-05, -0.0000e+00],
+         [ 0.0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00],
+         [ 0.0000e+00,  3.2071e-05,  0.0000e+00,  0.0000e+00],
+         [ 0.0000e+00,  0.0000e+00,  0.0000e+00,  3.2071e-05]]], 4)
 
 
 def test_deep_lift_shap_custom_linear(X, references, device):

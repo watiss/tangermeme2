@@ -18,6 +18,7 @@ from ._compat import _autocast_supported, _resolve_device
 from .ersatz import dinucleotide_shuffle
 from .results import AttributionReferencesResult
 from .utils import _validate_input
+from .deep_lift_utils import _nonlinear, _maxpool, _softmax, _layernorm, _rmsnorm, _hooks_disabled, _bilinear, BilinearOp
 
 
 def hypothetical_attributions(
@@ -121,102 +122,25 @@ def _clear_hooks(module):
 
 
 def _fp_hook(module, inputs): 
+	if _hooks_disabled():
+		return
+	
 	module.input = inputs[0].clone().detach()
 
 
 def _f_hook(module, inputs, outputs):
+	if _hooks_disabled():
+		return
+	
 	module.output = outputs.clone().detach()
 
 
 def _b_hook(module, grad_input, grad_output):
+	if _hooks_disabled():
+		return
+
 	return module._NON_LINEAR_OPS[type(module)](module, grad_input, 
 		grad_output)
-
-
-def _nonlinear(module, grad_input, grad_output):
-	"""An internal function implementing a general-purpose nonlinear correction.
-
-	This function, copied and slightly modified from Captum, is meant to be
-	the `rescale` rule applied to general non-linear functions such as
-	activations.
-	"""
-
-	delta_in_ = torch.sub(*module.input.chunk(2))
-	delta_out_ = torch.sub(*module.output.chunk(2))
-
-	delta_in = torch.cat([delta_in_, delta_in_])
-	delta_out = torch.cat([delta_out_, delta_out_])
-
-	delta = delta_out / delta_in
-	idxs = torch.abs(delta_in) < 1e-6
-
-	return (torch.where(idxs, grad_input[0], grad_output[0] * delta),)
-
-
-def _softmax(module, grad_input, grad_output):
-	"""An internal function implementing a correction for softmax activations.
-
-	This function, copied and slightly modified from Captum, is meant to be
-	the `rescale` rule applied specifically to softmax activations without
-	needing to remove them and operate on the underlying logits.
-	"""
-
-	delta_in_ = torch.sub(*module.input.chunk(2))
-	delta_out_ = torch.sub(*module.output.chunk(2))
-
-	delta_in = torch.cat([delta_in_, delta_in_])
-	delta_out = torch.cat([delta_out_, delta_out_])
-
-	delta = delta_out / delta_in
-	idxs = torch.abs(delta_in) < 1e-6
-
-	grad_input_unnorm = torch.where(idxs, grad_input[0], grad_output[0] * delta)
-
-	n = grad_input[0].numel()
-	new_grad_inp = grad_input_unnorm - grad_input_unnorm.sum() * 1 / n
-	return (new_grad_inp,)
-
-
-def _maxpool(module, grad_input, grad_output):
-	"""An internal function implementing a 1D max-pooling correction.
-
-	This function, copied and slightly modified from Captum, is meant to be
-	the `rescale` rule applied to max pooling layers given their nature of
-	aggregating values across multiple positions.
-	"""
-
-	if isinstance(module, torch.nn.MaxPool1d):
-		pool_func, unpool_func = F.max_pool1d, F.max_unpool1d
-	elif isinstance(module, torch.nn.MaxPool2d):
-		pool_func, unpool_func = F.max_pool2d, F.max_unpool2d
-	else:
-		raise ValueError("module must be either MaxPool1d or MaxPool2d")
-
-
-	with torch.no_grad():
-		delta_in_ = torch.sub(*module.input.chunk(2))
-		delta_in = torch.cat([delta_in_, delta_in_])
-
-		output, output_ref = module.output.chunk(2)
-		delta_out_xmax = torch.max(output, output_ref)
-		delta_out = torch.cat([delta_out_xmax - output_ref, 
-			output - delta_out_xmax])
-
-		_, indices = pool_func(module.input, module.kernel_size, module.stride, 
-			module.padding, module.dilation, module.ceil_mode, True)
-
-		unpool_ = unpool_func(grad_output[0] * delta_out, indices, 
-			module.kernel_size, module.stride, module.padding, 
-			list(module.input.shape))
-		unpool_delta, unpool_ref_delta = torch.chunk(unpool_, 2)
-
-	unpool_delta_ = unpool_delta + unpool_ref_delta
-	unpool_delta = torch.cat([unpool_delta_, unpool_delta_])
-	idxs = torch.abs(delta_in) < 1e-7
-
-	new_grad_inp = torch.where(idxs, grad_input[0], unpool_delta / delta_in)
-	return (new_grad_inp,)
-
 
 def deep_lift_shap(
 	model: torch.nn.Module,
@@ -419,10 +343,16 @@ def deep_lift_shap(
 		torch.nn.PReLU: _nonlinear,
 		torch.nn.MaxPool1d: _maxpool,
 		torch.nn.MaxPool2d: _maxpool,
-		torch.nn.Softmax: _softmax
+		torch.nn.Softmax: _softmax,
+		torch.nn.LayerNorm: _layernorm,
+		torch.nn.RMSNorm: _rmsnorm,
+		BilinearOp: _bilinear,
 	}
 
 	device = _resolve_device(device)
+
+	if random_state is not None:
+		print(f"Setting random state to {random_state}")
 
 	if dtype is None:
 		try:
@@ -461,6 +391,7 @@ def deep_lift_shap(
 		# Begin DeepLIFT procedure
 	
 		attributions, references_, Xi, rj, attr_ = [], [], [], [], []
+
 		if isinstance(references, torch.Tensor):
 			_validate_input(references, "references", shape=(X.shape[0], -1, X.shape[1], 
 				X.shape[2]), ohe=True, allow_N=False, ohe_dim=-2, only_warn=only_warn)
@@ -527,7 +458,7 @@ def deep_lift_shap(
 					if torch.any(convergence_deltas > warning_threshold):
 						warnings.warn("Convergence deltas too high: " +   
 							str(convergence_deltas), RuntimeWarning)
-
+						
 					if print_convergence_deltas:
 						print(convergence_deltas)
 
@@ -566,8 +497,6 @@ def deep_lift_shap(
 					references_.extend(list(_references.cpu().detach()))
 
 				Xi, rj = [], []
-
-
 
 		attributions = torch.stack(attributions)
 
